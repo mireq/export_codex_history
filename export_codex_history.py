@@ -15,7 +15,7 @@ from jinja2 import Environment, select_autoescape
 from markdown_it import MarkdownIt
 
 
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
 <head>
@@ -165,6 +165,40 @@ HTML_TEMPLATE = """
 
 		.content {
 			padding: 24px;
+		}
+
+		.search-panel {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			margin-bottom: 24px;
+			padding: 12px 14px;
+			border: 1px solid var(--border);
+			border-radius: 8px;
+			background: var(--surface);
+			box-shadow: var(--shadow);
+		}
+
+		.search-input {
+			flex: 1 1 auto;
+			min-width: 0;
+			padding: 10px 12px;
+			border: 1px solid var(--border-strong);
+			border-radius: 8px;
+			background: #141414;
+			color: var(--text);
+			font: 500 14px/1.4 var(--font-sans);
+		}
+
+		.search-input:focus {
+			outline: 1px solid var(--accent);
+			border-color: var(--accent);
+		}
+
+		.search-status {
+			color: var(--muted);
+			font-size: 13px;
+			white-space: nowrap;
 		}
 
 		.summary {
@@ -330,6 +364,19 @@ HTML_TEMPLATE = """
 		.item.assistant.finalized .rich-text {
 			color: var(--text);
 			font-size: 15px;
+		}
+
+		.turn.is-hidden,
+		.item.is-hidden,
+		.turn-link.is-hidden {
+			display: none;
+		}
+
+		mark.search-hit {
+			padding: 0 0.1em;
+			border-radius: 0.2em;
+			background: rgba(210, 176, 107, 0.35);
+			color: inherit;
 		}
 
 		.item.tool.success {
@@ -555,6 +602,18 @@ HTML_TEMPLATE = """
 			</header>
 
 			<div class="content">
+				<section class="search-panel">
+					<input
+						id="history-search"
+						class="search-input"
+						type="search"
+						placeholder="Search history"
+						autocomplete="off"
+						spellcheck="false"
+					>
+					<div id="search-status" class="search-status">Showing all items</div>
+				</section>
+
 				<section class="summary">
 					<div class="summary-item">
 						<div class="summary-label">Turns</div>
@@ -576,7 +635,7 @@ HTML_TEMPLATE = """
 
 				<section class="timeline">
 				{% for turn in turns %}
-				<article class="turn" id="{{ turn.anchor }}">
+				<article class="turn" id="{{ turn.anchor }}" data-turn>
 					<div class="turn-header">
 						<div>
 							<div class="turn-title">Turn {{ loop.index }}</div>
@@ -587,7 +646,7 @@ HTML_TEMPLATE = """
 
 					<div class="items">
 						{% for item in turn.items %}
-						<section class="item {{ item.kind }} {{ item.tone }}{% if item.badge == 'Assistant Final' %} finalized{% endif %}">
+						<section class="item {{ item.kind }} {{ item.tone }}{% if item.badge == 'Assistant Final' %} finalized{% endif %}" data-search-item>
 							{% if item.kind == "tool" %}
 							<details class="tool-shell">
 								<summary>
@@ -652,6 +711,100 @@ HTML_TEMPLATE = """
 			</div>
 		</section>
 	</main>
+	<script>
+		(function() {
+			const input = document.getElementById("history-search");
+			const status = document.getElementById("search-status");
+			const turns = Array.from(document.querySelectorAll("[data-turn]"));
+			const navLinks = Array.from(document.querySelectorAll(".turn-link"));
+			const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+			function clearHighlights(node) {
+				for (const mark of node.querySelectorAll("mark.search-hit")) {
+					const parent = mark.parentNode;
+					if (!parent) continue;
+					parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
+					parent.normalize();
+				}
+			}
+
+			function highlightNode(node, regex) {
+				const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
+					acceptNode(textNode) {
+						const parent = textNode.parentElement;
+						if (!parent) return NodeFilter.FILTER_REJECT;
+						if (parent.closest("script, style, .item-label, .timestamp, .tool-meta")) {
+							return NodeFilter.FILTER_REJECT;
+						}
+						return textNode.textContent && regex.test(textNode.textContent)
+							? NodeFilter.FILTER_ACCEPT
+							: NodeFilter.FILTER_REJECT;
+					}
+				});
+
+				const matches = [];
+				while (walker.nextNode()) {
+					matches.push(walker.currentNode);
+				}
+
+				for (const textNode of matches) {
+					const text = textNode.textContent || "";
+					const fragment = document.createDocumentFragment();
+					let lastIndex = 0;
+					text.replace(regex, (match, offset) => {
+						if (offset > lastIndex) {
+							fragment.appendChild(document.createTextNode(text.slice(lastIndex, offset)));
+						}
+						const mark = document.createElement("mark");
+						mark.className = "search-hit";
+						mark.textContent = match;
+						fragment.appendChild(mark);
+						lastIndex = offset + match.length;
+						return match;
+					});
+					if (lastIndex < text.length) {
+						fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+					}
+					textNode.parentNode.replaceChild(fragment, textNode);
+				}
+			}
+
+			function applySearch() {
+				const query = input.value.trim();
+				const active = query.length > 0;
+				const regex = active ? new RegExp(escapeRegExp(query), "gi") : null;
+				let visibleItems = 0;
+
+				turns.forEach((turn, index) => {
+					let turnVisibleCount = 0;
+					const items = Array.from(turn.querySelectorAll("[data-search-item]"));
+					items.forEach((item) => {
+						clearHighlights(item);
+						const matches = !active || item.textContent.toLowerCase().includes(query.toLowerCase());
+						item.classList.toggle("is-hidden", !matches);
+						if (matches) {
+							turnVisibleCount += 1;
+							visibleItems += 1;
+							if (regex) {
+								highlightNode(item, regex);
+							}
+						}
+					});
+					const turnVisible = turnVisibleCount > 0;
+					turn.classList.toggle("is-hidden", !turnVisible);
+					if (navLinks[index]) {
+						navLinks[index].classList.toggle("is-hidden", !turnVisible);
+					}
+				});
+
+				status.textContent = active
+					? `Found ${visibleItems} matching item${visibleItems === 1 ? "" : "s"}`
+					: "Showing all items";
+			}
+
+			input.addEventListener("input", applySearch);
+		})();
+	</script>
 </body>
 </html>
 """
@@ -761,7 +914,7 @@ def sanitize_text(value: str) -> str:
 
 
 def summarize_tool_output(value: str, *, max_chars: int = 12000) -> str:
-	sanitized = sanitize_text(value.rstrip())
+	sanitized = scrub_visible_text(sanitize_text(value.rstrip()))
 	replacement_count = sanitized.count("\uFFFD")
 	if replacement_count > 24:
 		excerpt_lines = [line for line in sanitized.splitlines() if line.strip()]
@@ -783,21 +936,18 @@ def preview_text(value: str, *, max_lines: int = 5, max_chars: int = 800) -> str
 	return preview
 
 
-def extract_environment_info(message: str) -> tuple[str, str]:
-	pattern = re.compile(r"\s*<environment_info>\n?(.*?)\n?</environment_info>\s*$", re.DOTALL)
-	match = pattern.search(message)
-	if not match:
-		return message, ""
-	main = message[: match.start()].rstrip()
-	env = match.group(1).strip()
-	return main, env
+def strip_environment_info(message: str) -> str:
+	stripped = re.sub(
+		r"\s*<environment_info>\n?.*?\n?</environment_info>\s*",
+		"\n\n",
+		message,
+		flags=re.DOTALL,
+	)
+	return stripped.replace("environment_info", "environment").strip()
 
 
-def render_environment_info(env_text: str) -> str:
-	if not env_text:
-		return ""
-	escaped = html.escape(env_text)
-	return f"<div>environment</div><pre>{escaped}</pre>"
+def scrub_visible_text(message: str) -> str:
+	return strip_environment_info(message).strip()
 
 
 def extract_shell_command(arguments: str, fallback_name: str) -> str:
@@ -867,7 +1017,7 @@ def plain_message_from_content(content: list[dict[str, Any]]) -> str:
 			text = block.get("text", "").strip()
 			if text:
 				chunks.append(text)
-	return sanitize_text("\n\n".join(chunks).strip())
+	return scrub_visible_text(sanitize_text("\n\n".join(chunks).strip()))
 
 
 def build_markdown_renderer() -> MarkdownIt:
@@ -925,26 +1075,24 @@ def export_history(input_path: Path, output_path: Path, title_override: str | No
 			continue
 
 		if inner_type == "user_message":
-			message, environment_info = extract_environment_info(
-				sanitize_text(payload.get("message", "").strip())
-			)
+			message = scrub_visible_text(sanitize_text(payload.get("message", "").strip()))
 			item = TimelineItem(
 				kind="user",
 				badge="User",
 				timestamp=compact_timestamp(timestamp),
 				html=markdown.render(message) if message else "",
-				meta_html=render_environment_info(environment_info),
 			)
 			current_turn["items"].append(item)
 			counts["messages"] += 1
 			continue
 
 		if inner_type == "agent_message":
+			message = scrub_visible_text(sanitize_text(payload.get("message", "").strip()))
 			item = TimelineItem(
 				kind="assistant",
 				badge="Assistant Update",
 				timestamp=compact_timestamp(timestamp),
-				html=markdown.render(sanitize_text(payload.get("message", "").strip())),
+				html=markdown.render(message) if message else "",
 			)
 			current_turn["items"].append(item)
 			counts["messages"] += 1
@@ -1001,7 +1149,7 @@ def export_history(input_path: Path, output_path: Path, title_override: str | No
 
 		if inner_type == "task_complete":
 			body = payload.get("last_agent_message", "").strip()
-			body_sanitized = sanitize_text(body)
+			body_sanitized = scrub_visible_text(sanitize_text(body))
 			if current_turn["items"]:
 				last_item = current_turn["items"][-1]
 				if (
@@ -1032,7 +1180,7 @@ def export_history(input_path: Path, output_path: Path, title_override: str | No
 						badge="Reasoning Summary",
 						timestamp=compact_timestamp(timestamp),
 						html=markdown.render(
-							sanitize_text("\n".join(f"- {line}" for line in summary))
+							scrub_visible_text(sanitize_text("\n".join(f"- {line}" for line in summary)))
 						),
 					)
 				)
