@@ -1020,6 +1020,59 @@ def plain_message_from_content(content: list[dict[str, Any]]) -> str:
 	return scrub_visible_text(sanitize_text("\n\n".join(chunks).strip()))
 
 
+def extract_embedded_transcript(message: str) -> list[tuple[str, str]]:
+	start_match = re.search(r"^>>> TRANSCRIPT (?:START|DELTA START)$", message, re.MULTILINE)
+	if start_match is None:
+		return []
+
+	transcript = message[start_match.end() :]
+	end_match = re.search(
+		r"^>>> (?:TRANSCRIPT END|APPROVAL REQUEST START)$",
+		transcript,
+		re.MULTILINE,
+	)
+	if end_match is not None:
+		transcript = transcript[: end_match.start()]
+	entry_pattern = re.compile(
+		r"^\[(\d+)\] (user|assistant|tool [^\n]+ (?:call|result)):\s?(.*)$",
+		re.MULTILINE,
+	)
+	matches = list(entry_pattern.finditer(transcript))
+	if not matches:
+		return []
+
+	entries: list[tuple[str, str]] = []
+	for index, match in enumerate(matches):
+		body_end = matches[index + 1].start() if index + 1 < len(matches) else len(transcript)
+		body = match.group(3) + transcript[match.end() : body_end]
+		body = body.strip()
+		if not body:
+			continue
+		label = match.group(2)
+		if label == "user":
+			kind = "user"
+		elif label == "assistant":
+			kind = "assistant"
+		elif label.endswith(" call"):
+			kind = "tool_call"
+		else:
+			kind = "tool_result"
+		entries.append((kind, body))
+	return entries
+
+
+def reasoning_summary_text(summary: list[Any]) -> list[str]:
+	lines: list[str] = []
+	for entry in summary:
+		if isinstance(entry, dict):
+			text = entry.get("text") or entry.get("summary_text")
+		else:
+			text = entry
+		if isinstance(text, str) and text.strip():
+			lines.append(text.strip())
+	return lines
+
+
 def build_markdown_renderer() -> MarkdownIt:
 	return MarkdownIt("commonmark", {"html": False, "breaks": True}).enable("table")
 
@@ -1044,6 +1097,26 @@ def export_history(input_path: Path, output_path: Path, title_override: str | No
 	pending_calls: dict[str, TimelineItem] = {}
 	pending_call_args: dict[str, str] = {}
 	counts: Counter[str] = Counter()
+	has_event_user_messages = any(
+		(record.get("payload") or {}).get("type") == "user_message"
+		for record in records
+		if record.get("type") == "event_msg"
+	)
+	event_message_texts = {
+		scrub_visible_text(
+			sanitize_text(
+				(
+					(record.get("payload") or {}).get("message")
+					or (record.get("payload") or {}).get("last_agent_message")
+					or ""
+				).strip()
+			)
+		)
+		for record in records
+		if record.get("type") == "event_msg"
+		and (record.get("payload") or {}).get("type")
+		in {"user_message", "agent_message", "task_complete"}
+	}
 
 	for record in records:
 		timestamp = record.get("timestamp")
@@ -1074,8 +1147,59 @@ def export_history(input_path: Path, output_path: Path, title_override: str | No
 		if current_turn is None:
 			continue
 
+		if outer_type == "response_item" and inner_type == "message":
+			role = payload.get("role")
+			if role not in {"user", "assistant"}:
+				continue
+			message = plain_message_from_content(payload.get("content", []))
+			if not message:
+				continue
+			if role == "user" and has_event_user_messages:
+				continue
+			if message in event_message_texts:
+				continue
+			current_turn["items"].append(
+				TimelineItem(
+					kind=role,
+					badge="User" if role == "user" else "Assistant Update",
+					timestamp=compact_timestamp(timestamp),
+					html=markdown.render(message),
+				)
+			)
+			counts["messages"] += 1
+			continue
+
 		if inner_type == "user_message":
 			message = scrub_visible_text(sanitize_text(payload.get("message", "").strip()))
+			embedded_entries = extract_embedded_transcript(message)
+			if embedded_entries:
+				for kind, body in embedded_entries:
+					if kind in {"user", "assistant"}:
+						current_turn["items"].append(
+							TimelineItem(
+								kind=kind,
+								badge="User" if kind == "user" else "Assistant Update",
+								timestamp=compact_timestamp(timestamp),
+								html=markdown.render(scrub_visible_text(sanitize_text(body))),
+							)
+						)
+						counts["messages"] += 1
+						continue
+					tool_output = summarize_tool_output(body)
+					is_call = kind == "tool_call"
+					current_turn["items"].append(
+						TimelineItem(
+							kind="tool",
+							badge="tool call" if is_call else "shell output",
+							timestamp=compact_timestamp(timestamp),
+							title_text="tool call" if is_call else "shell output",
+							tone="neutral" if is_call else detect_output_tone(body),
+							tool_output=tool_output if is_call else extract_output_body(tool_output),
+							details=[DetailBlock(title="tool", body="", tone="neutral")],
+						)
+					)
+					counts["tool_calls"] += 1 if is_call else 0
+				continue
 			item = TimelineItem(
 				kind="user",
 				badge="User",
@@ -1172,7 +1296,7 @@ def export_history(input_path: Path, output_path: Path, title_override: str | No
 			continue
 
 		if inner_type == "reasoning":
-			summary = payload.get("summary") or []
+			summary = reasoning_summary_text(payload.get("summary") or [])
 			if summary:
 				current_turn["items"].append(
 					TimelineItem(
